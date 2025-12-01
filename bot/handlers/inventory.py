@@ -1,16 +1,14 @@
 # handlers/inventory.py
 """
-Inventory handlers - rewritten to preserve original 'Witel' as origin and
-store current owner location separately (Witel Sekarang / Divisi Sekarang).
+Inventory handlers.
 
-Key behaviors:
-- 'Witel' column is treated as original/origin (if present in sheet).
-- New/ensured columns: 'Witel Sekarang', 'Divisi Sekarang', 'Witel Asal', 'Divisi Asal'
-  - We will NOT overwrite 'Witel' except to populate 'Witel Asal' if that column exists and is empty.
-- On viewing an item, bot will attempt to read owner profile from 'Users' and write
-  'Witel Sekarang'/'Divisi Sekarang' accordingly (best-effort).
-- Display shows both origin and current owner location clearly.
+Tujuan utama:
+- Menampilkan inventaris dengan informasi lokasi:
+  - Lokasi asal:  Witel Asal / Divisi Asal  (diisi saat barang pertama dibuat / oleh admin).
+  - Lokasi sekarang: Witel Sekarang / Divisi Sekarang (disinkronkan dengan profil pemilik di sheet Users).
+- Tidak lagi mengubah / mengisi Witel Asal & Divisi Asal secara otomatis saat view.
 """
+
 from __future__ import annotations
 
 import asyncio
@@ -119,14 +117,22 @@ def _label_for_button(
 
 def _format_item_summary_from_rec(row: int, rec: Dict[str, Any]) -> str:
     """
-    Build the multi-line detailed text for an item (used when viewing a specific row).
-    Shows both origin (Witel / Divisi) and current owner's location (Witel Sekarang / Divisi Sekarang).
-    Falls back gracefully to '-' when values missing.
+    Build teks detail untuk satu item.
+
+    Perubahan penting:
+    - Witel Asal / Divisi Asal hanya diambil dari kolom *Asal*.
+      Jika kosong -> tampil '-'. Tidak lagi fallback ke 'Witel' / 'Divisi'.
+    - Witel Sekarang / Divisi Sekarang diambil dari kolom '... Sekarang'
+      dengan fallback ke 'Witel' / 'Divisi' (lokasi di sheet Inventaris).
     """
     name = rec.get("Nama Barang", "") or rec.get("Nama", "")
     cat = rec.get("Kategori", "")
-    origin_witel = rec.get("Witel Asal") or rec.get("Witel") or "-"
-    origin_div = rec.get("Divisi Asal") or rec.get("Divisi") or "-"
+
+    # Lokasi asal: hanya baca kolom Asal, tidak fallback ke Witel/Divisi
+    origin_witel = rec.get("Witel Asal") or "-"
+    origin_div = rec.get("Divisi Asal") or "-"
+
+    # Lokasi sekarang: ambil kolom Sekarang, fallback ke kolom utama
     current_witel = rec.get("Witel Sekarang") or ""
     current_div = rec.get("Divisi Sekarang") or ""
     if not current_witel:
@@ -137,11 +143,8 @@ def _format_item_summary_from_rec(row: int, rec: Dict[str, Any]) -> str:
     total = rec.get("Total Qty", "")
     available = rec.get("Tersedia", "")
     status = rec.get("Status", "")
-    owner = (
-        rec.get("Pemilik Nama", "")
-        or rec.get("Pemilik ID", "")
-        or "-"
-    )
+    owner = rec.get("Pemilik Nama", "") or rec.get("Pemilik ID", "") or "-"
+
     k1 = rec.get("Keterangan 1", "") or rec.get("Keterangan", "")
     k2 = rec.get("Keterangan 2", "")
     k3 = rec.get("Serial Number", "")
@@ -873,9 +876,13 @@ async def _sync_owner_location_to_inventaris(
     owner_profile: Tuple[str, str],
 ) -> None:
     """
-    Write owner_profile -> ('Witel Sekarang','Divisi Sekarang') on the given sheet_row.
-    Preserve original 'Witel' as origin; if 'Witel Asal' exists and empty, fill it from 'Witel'.
-    This function is best-effort and logs errors.
+    Sinkron lokasi pemilik ke kolom:
+      - Witel Sekarang
+      - Divisi Sekarang
+
+    **Catatan penting:**
+    - Fungsi ini TIDAK lagi mengisi / mengubah Witel Asal atau Divisi Asal.
+      Kolom asal diharapkan sudah diisi saat barang dibuat atau oleh admin.
     """
     try:
         if not sheets or sheet_row <= 0:
@@ -904,86 +911,13 @@ async def _sync_owner_location_to_inventaris(
             retries=3,
             delay=0.3,
         )
-        col_witel = headers.get("Witel")
-        col_div = headers.get("Divisi")
-        col_wasal = headers.get("Witel Asal")
-        col_dasal = headers.get("Divisi Asal")
         col_wsekarang = headers.get("Witel Sekarang")
         col_dsekarang = headers.get("Divisi Sekarang")
-
-        old_witel = ""
-        old_div = ""
-        try:
-            if col_witel:
-                old_witel = str(
-                    await sheets.async_get_cell_value(
-                        INVENTARIS_SHEET,
-                        sheet_row,
-                        col_witel,
-                    )
-                    or ""
-                ).strip()
-            if col_div:
-                old_div = str(
-                    await sheets.async_get_cell_value(
-                        INVENTARIS_SHEET,
-                        sheet_row,
-                        col_div,
-                    )
-                    or ""
-                ).strip()
-        except Exception:
-            old_witel = old_witel or ""
-            old_div = old_div or ""
 
         new_witel = (owner_profile[0] or "").strip()
         new_div = (owner_profile[1] or "").strip()
 
-        try:
-            if col_wasal:
-                cur = str(
-                    await sheets.async_get_cell_value(
-                        INVENTARIS_SHEET,
-                        sheet_row,
-                        col_wasal,
-                    )
-                    or ""
-                ).strip()
-                if not cur and old_witel:
-                    await retry_async(
-                        sheets.async_update_cell,
-                        INVENTARIS_SHEET,
-                        sheet_row,
-                        col_wasal,
-                        old_witel,
-                        retries=2,
-                        delay=0.2,
-                    )
-            if col_dasal:
-                cur = str(
-                    await sheets.async_get_cell_value(
-                        INVENTARIS_SHEET,
-                        sheet_row,
-                        col_dasal,
-                    )
-                    or ""
-                ).strip()
-                if not cur and old_div:
-                    await retry_async(
-                        sheets.async_update_cell,
-                        INVENTARIS_SHEET,
-                        sheet_row,
-                        col_dasal,
-                        old_div,
-                        retries=2,
-                        delay=0.2,
-                    )
-        except Exception:
-            logger.debug(
-                "_sync_owner_location_to_inventaris: failed to populate Witel Asal/Divisi Asal",
-                exc_info=True,
-            )
-
+        # Update hanya kolom "Sekarang"
         try:
             if col_wsekarang:
                 cur = str(
@@ -1099,6 +1033,7 @@ async def inv_view_row_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if 0 <= idx0 < len(inv_records):
         rec = inv_records[idx0]
 
+        # sinkron lokasi pemilik ke kolom Witel Sekarang / Divisi Sekarang
         owner_raw = (
             rec.get("Pemilik ID")
             or rec.get("PemilikId")
@@ -1275,6 +1210,9 @@ async def inv_reduce_row_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # Text handler: custom search, and reduce flows
 # -------------------------
 async def text_message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    # NOTE: handler ini dipasang dengan block=False di register_inventory_handlers
+    # supaya tidak menghalangi handler lain (misalnya flow /kembali) ketika
+    # tidak sedang menunggu input inventory.
     if context.user_data.get("awaiting_inv_custom_search"):
         if not await require_registration(update, context):
             context.user_data.pop("awaiting_inv_custom_search", None)
@@ -1490,6 +1428,7 @@ async def text_message_handler(update: Update, context: ContextTypes.DEFAULT_TYP
             )
         return
 
+    # kalau tidak ada flag inventory yg aktif, jangan ngapa-ngapain biar handler lain bisa jalan
     return
 
 
@@ -1956,8 +1895,14 @@ def register_inventory_handlers(application):
         )
     )
 
+    # PENTING: block=False supaya handler ini tidak menghalangi handler lain
+    # seperti flow /kembali di file lain.
     application.add_handler(
-        MessageHandler(filters.TEXT & ~filters.COMMAND, text_message_handler)
+        MessageHandler(
+            filters.TEXT & ~filters.COMMAND,
+            text_message_handler,
+            block=False,
+        )
     )
 
 
