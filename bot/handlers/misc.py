@@ -112,76 +112,123 @@ async def _find_peminjaman_row_by_txn(
     return row_idx, pem_headers
 
 
-async def _archive_txn_row(
-    sheets, row_idx: int, pem_headers: Dict[str, int]
-) -> bool:
-    """Append ringkasan TXN ke 'Peminjaman_Archive', lalu tandai baris asli sebagai Archived."""
+async def _archive_txn_row(sheets, row_idx: int, pem_headers: Dict[str, int]) -> bool:
+    """
+    Arsipkan satu baris transaksi peminjaman ke sheet 'Peminjaman_Archive'.
+
+    - Membaca data lengkap dari sheet PEMINJAMAN (berdasarkan row_idx + pem_headers)
+    - Menulis ringkasan ke sheet 'Peminjaman_Archive'
+    - Menandai baris asli di PEMINJAMAN sebagai 'Archived' dan Qty Dipinjam = 0
+
+    Return:
+        True  -> kalau proses append & penandaan berhasil (atau minimal append sukses)
+        False -> kalau terjadi error fatal (akan tercatat di log)
+    """
+    if not sheets or not row_idx or row_idx < 2:
+        return False
+
     try:
         ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
         async def safe_get(colname: str) -> str:
+            """
+            Helper aman untuk baca satu kolom dari baris peminjaman.
+            Kalau header tidak ada atau baca gagal -> return "".
+            """
+            col_idx = pem_headers.get(colname)
+            if not col_idx:
+                return ""
             try:
-                v = await sheets.async_get_cell_value(
-                    PEMINJAMAN_SHEET, row_idx, pem_headers.get(colname)
-                )
+                v = await sheets.async_get_cell_value(PEMINJAMAN_SHEET, row_idx, col_idx)
                 return str(v or "")
             except Exception:
                 return ""
 
-        txn = await safe_get("ID Transaksi")
-        nama = await safe_get("Nama Barang")
-        pid = await safe_get("Peminjam ID")
-        pname = await safe_get("Peminjam Nama")
-        qty = await safe_get("Qty Dipinjam")
-        tgl = await safe_get("Tanggal Pinjam")
-        dl = await safe_get("Deadline")
+        # --- Baca nilai dari baris peminjaman (di sheet PEMINJAMAN) ---
+        txn    = await safe_get("ID Transaksi")
+        nama   = await safe_get("Nama Barang")
+        pid    = await safe_get("Peminjam ID")
+        pname  = await safe_get("Peminjam Nama")
+        qty    = await safe_get("Qty Dipinjam")
+        tgl    = await safe_get("Tanggal Pinjam")
+        dl     = await safe_get("Deadline")
         status = await safe_get("Status Peminjaman")
 
-        await sheets.async_ensure_headers(
-            "Peminjaman_Archive",
-            [
-                "Archived At",
-                "ID Transaksi",
-                "Nama Barang",
-                "Peminjam ID",
-                "Peminjam Nama",
-                "Qty Dipinjam",
-                "Tanggal Pinjam",
-                "Deadline",
-                "Status Peminjaman",
-            ],
-        )
-        await sheets.async_append_row(
-            "Peminjaman_Archive",
-            [ts, txn, nama, pid, pname, qty, tgl, dl, status],
-        )
+        # Kalau TXN kosong, kemungkinan baris sudah tidak valid -> jangan lanjut
+        if not txn:
+            logger.warning(f"_archive_txn_row: empty TXN at row {row_idx}, skip archive")
+            return False
 
+        # --- Pastikan header di sheet Peminjaman_Archive sudah benar ---
+        archive_headers = [
+            "Archived At",
+            "ID Transaksi",
+            "Nama Barang",
+            "Peminjam ID",
+            "Peminjam Nama",
+            "Qty Dipinjam",
+            "Tanggal Pinjam",
+            "Deadline",
+            "Status Peminjaman",
+        ]
+        await sheets.async_ensure_headers("Peminjaman_Archive", archive_headers)
+
+        # Susunan data HARUS sesuai urutan archive_headers di atas
+        archive_row = [ts, txn, nama, pid, pname, qty, tgl, dl, status]
+
+        # --- Append ke sheet arsip ---
         try:
-            await sheets.async_update_cell(
-                PEMINJAMAN_SHEET,
-                row_idx,
-                pem_headers["ID Transaksi"],
-                f"ARCHIVED_{txn or ''}".strip("_"),
-            )
-            await sheets.async_update_cell(
-                PEMINJAMAN_SHEET,
-                row_idx,
-                pem_headers["Qty Dipinjam"],
-                "0",
-            )
-            await sheets.async_update_cell(
-                PEMINJAMAN_SHEET,
-                row_idx,
-                pem_headers["Status Peminjaman"],
-                "Archived",
-            )
+            await sheets.async_append_row("Peminjaman_Archive", archive_row)
         except Exception:
-            logger.exception("mark archived failed", exc_info=True)
+            logger.exception("_archive_txn_row: async_append_row ke Peminjaman_Archive gagal", exc_info=True)
+            return False
+
+        # --- Tandai baris asli di PEMINJAMAN sebagai Archived ---
+        try:
+            id_col = pem_headers.get("ID Transaksi")
+            qty_col = pem_headers.get("Qty Dipinjam")
+            st_col = pem_headers.get("Status Peminjaman")
+
+            if id_col:
+                new_id = f"ARCHIVED_{txn}".strip("_")
+                await sheets.async_update_cell(PEMINJAMAN_SHEET, row_idx, id_col, new_id)
+            if qty_col:
+                await sheets.async_update_cell(PEMINJAMAN_SHEET, row_idx, qty_col, "0")
+            if st_col:
+                await sheets.async_update_cell(PEMINJAMAN_SHEET, row_idx, st_col, "Archived")
+        except Exception:
+            logger.exception("_archive_txn_row: gagal menandai baris asli sebagai Archived", exc_info=True)
+            # walaupun penandaan gagal, arsip sudah tercatat -> tidak kita anggap fatal
+            return True
 
         return True
+
     except Exception:
-        logger.exception("_archive_txn_row failed", exc_info=True)
+        logger.exception("_archive_txn_row: error tidak terduga", exc_info=True)
         return False
+
+
+async def _get_item_specs_for_msg(
+    sheets,
+    inv_row: int,
+    inv_headers: Dict[str, int],
+) -> str:
+    """
+    Ambil detail keterangan barang dari INVENTARIS untuk ditampilkan di pesan:
+    gabungan dari Keterangan, Keterangan 1-3, dan Serial Number.
+    """
+    parts: List[str] = []
+    for key in ("Keterangan", "Keterangan 1", "Keterangan 2", "Keterangan 3", "Serial Number"):
+        col = inv_headers.get(key)
+        if not col:
+            continue
+        try:
+            v = await sheets.async_get_cell_value(INVENTARIS_SHEET, inv_row, col)
+        except Exception:
+            v = None
+        if v not in (None, ""):
+            parts.append(str(v))
+    return " | ".join(parts)
 
 
 # ---- Witel utilities (robust read)
@@ -969,6 +1016,7 @@ async def kembali_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 headers_map=inv_headers,
             )
             pemilik_id = None
+            specs_text = ""
             if inv_row:
                 pemilik_raw = await sheets.async_get_cell_value(
                     INVENTARIS_SHEET,
@@ -983,6 +1031,17 @@ async def kembali_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     )
                 except Exception:
                     pemilik_id = None
+                # detail keterangan
+                try:
+                    specs_text = await _get_item_specs_for_msg(
+                        sheets, inv_row, inv_headers
+                    )
+                except Exception:
+                    specs_text = ""
+
+            detail_line = (
+                f"\nDetail: `{escape_md(specs_text)}`" if specs_text else ""
+            )
 
             kb = [
                 [
@@ -999,7 +1058,8 @@ async def kembali_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
             text = (
                 "📩 Permintaan Pengembalian\n\n"
                 f"TXN: `{escape_md(txn)}`\n"
-                f"Barang: *{escape_md(nama)}*\n"
+                f"Barang: *{escape_md(nama)}*"
+                f"{detail_line}\n"
                 f"Permintaan oleh: `{escape_md(str(caller_id))}`\n\n"
                 "Tekan ✅ jika sudah diterima, atau ❌ untuk menolak."
             )
@@ -1301,6 +1361,7 @@ async def handle_kembali_message(
             headers_map=inv_headers,
         )
         pemilik_id = None
+        specs_text = ""
         if inv_row:
             pemilik_raw = await sheets.async_get_cell_value(
                 INVENTARIS_SHEET,
@@ -1312,6 +1373,17 @@ async def handle_kembali_message(
                 if pemilik_raw not in (None, "")
                 else None
             )
+            # detail keterangan
+            try:
+                specs_text = await _get_item_specs_for_msg(
+                    sheets, inv_row, inv_headers
+                )
+            except Exception:
+                specs_text = ""
+
+        detail_line = (
+            f"\nDetail: `{escape_md(specs_text)}`" if specs_text else ""
+        )
 
         kb = [
             [
@@ -1328,7 +1400,8 @@ async def handle_kembali_message(
         text = (
             "📩 Permintaan Pengembalian\n\n"
             f"TXN: `{escape_md(str(txn))}`\n"
-            f"Barang: *{escape_md(str(nama))}*\n"
+            f"Barang: *{escape_md(str(nama))}*"
+            f"{detail_line}\n"
             f"Permintaan oleh: `{escape_md(str(caller_id))}`\n"
             f"Jumlah yang ingin dikembalikan: *{qty}*\n\n"
             "Tekan ✅ jika sudah diterima, atau ❌ untuk menolak."
