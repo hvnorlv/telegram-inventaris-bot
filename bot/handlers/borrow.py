@@ -208,29 +208,65 @@ async def _find_item_row_by_name(
     name: str,
     headers_map: Optional[Dict[str, int]] = None,
 ) -> Optional[int]:
+    """
+    Cari baris item di INVENTARIS berdasarkan Nama Barang.
+
+    Urutan:
+      1) exact match via async_find_row_by_value (kalau ada)
+      2) fallback scan:
+           - skip Status=Removed
+           - cari exact match (case-insensitive)
+           - kalau tidak ada, ambil baris pertama yang *mengandung* nama tsb
+    """
     headers_map = headers_map or await _ensure_inventaris_headers(sheets)
-    # prefer sheet helper if present
+
+    # 1) helper bawaan (kalau ada)
     if hasattr(sheets, "async_find_row_by_value"):
         try:
-            return await sheets.async_find_row_by_value(
+            row = await sheets.async_find_row_by_value(
                 INVENTARIS_SHEET,
                 "Nama Barang",
                 name,
                 headers_map=headers_map,
             )
+            if row:
+                return row
         except Exception:
             logger.debug(
                 "_find_item_row_by_name: async_find_row_by_value failed; falling back",
                 exc_info=True,
             )
+
+    # 2) fallback scan manual
     try:
         recs = await sheets.async_get_all_records(INVENTARIS_SHEET)
-        for idx, r in enumerate(recs):
-            if str(r.get("Nama Barang", "")).strip().lower() == str(name).strip().lower():
-                return idx + 2
     except Exception:
         logger.exception("_find_item_row_by_name: fallback scan failed")
-    return None
+        return None
+
+    target = str(name).strip().lower()
+    best_row: Optional[int] = None
+
+    for idx, r in enumerate(recs):
+        # skip removed
+        status = str(r.get("Status", "") or "").strip().lower()
+        if status == "removed":
+            continue
+
+        nm = str(r.get("Nama Barang", "")).strip()
+        if not nm:
+            continue
+        nm_lc = nm.lower()
+
+        # exact (ignore case)
+        if nm_lc == target:
+            return idx + 2
+
+        # candidate: mengandung kata tsb
+        if target and target in nm_lc and best_row is None:
+            best_row = idx + 2
+
+    return best_row
 
 
 async def _get_owner_for_item(
@@ -259,6 +295,76 @@ async def _get_owner_for_item(
         return int(str(raw).strip()), raw_name
     except Exception:
         return None, raw_name
+
+
+async def _get_available_stock(
+    sheets,
+    row_idx: int,
+    inv_headers: Dict[str, int],
+) -> int:
+    """
+    Baca stok tersedia dari baris INVENTARIS:
+
+    - Jika Status = Removed -> stok 0.
+    - Kalau kolom 'Tersedia' ada & berisi angka >=0 -> pakai itu.
+    - Jika 'Tersedia' kosong / tidak valid, tapi 'Total Qty' ada -> pakai 'Total Qty'.
+    """
+    if not row_idx or row_idx < 2:
+        return 0
+
+    # cek status
+    try:
+        st_col = inv_headers.get("Status")
+        if st_col:
+            st = await sheets.async_get_cell_value(
+                INVENTARIS_SHEET,
+                row_idx,
+                st_col,
+            )
+            st_norm = str(st or "").strip().lower()
+            if st_norm == "removed":
+                return 0
+    except Exception:
+        pass
+
+    ters_col = inv_headers.get("Tersedia")
+    total_col = inv_headers.get("Total Qty")
+
+    ters_val: Optional[int] = None
+    total_val: Optional[int] = None
+
+    # baca Tersedia
+    if ters_col:
+        try:
+            v = await sheets.async_get_cell_value(
+                INVENTARIS_SHEET,
+                row_idx,
+                ters_col,
+            )
+            # sentinel negatif menandakan "tidak valid"
+            ters_val = safe_int(v, -999_999)
+        except Exception:
+            ters_val = -999_999
+
+    # baca Total Qty
+    if total_col:
+        try:
+            v = await sheets.async_get_cell_value(
+                INVENTARIS_SHEET,
+                row_idx,
+                total_col,
+            )
+            total_val = safe_int(v, 0)
+        except Exception:
+            total_val = 0
+
+    if ters_val is not None and ters_val >= 0:
+        return ters_val
+
+    if total_val is not None:
+        return max(0, total_val)
+
+    return 0
 
 
 def _parse_deadline_input(text: Optional[str]) -> Optional[str]:
@@ -427,7 +533,8 @@ async def pinjam_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await send_md(update, "❌ Layanan Google Sheets belum tersedia.")
             return
 
-        row_idx = await _find_item_row_by_name(sheets, name)
+        inv_headers = await _ensure_inventaris_headers(sheets)
+        row_idx = await _find_item_row_by_name(sheets, name, headers_map=inv_headers)
         if not row_idx:
             await send_md(
                 update,
@@ -436,7 +543,8 @@ async def pinjam_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
             )
             return
 
-        owner_id, _ = await _get_owner_for_item(sheets, row_idx)
+        # cek pemilik: tidak boleh meminjam barang sendiri
+        owner_id, _ = await _get_owner_for_item(sheets, row_idx, inv_headers)
         if owner_id and owner_id == user.id:
             await send_md(
                 update,
@@ -444,14 +552,14 @@ async def pinjam_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
             )
             return
 
-        inv_headers = await _ensure_inventaris_headers(sheets)
-        col_ters = inv_headers.get("Tersedia")
-        cur_ters = (
-            await sheets.async_get_cell_value(INVENTARIS_SHEET, row_idx, col_ters)
-            if col_ters
-            else ""
-        )
-        available = safe_int(cur_ters, 0)
+        available = await _get_available_stock(sheets, row_idx, inv_headers)
+        if available <= 0:
+            await send_md(
+                update,
+                f"⚠️ Stok untuk *{escape_md(name)}* saat ini: {available}. Tidak dapat meminjam sekarang.",
+                parse_mode="Markdown",
+            )
+            return
         if qty > available:
             await send_md(
                 update,
@@ -742,10 +850,7 @@ async def cari_view_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
     except Exception:
         rec = {}
 
-    available = safe_int(
-        rec.get("Tersedia") or rec.get("Total Qty") or 0,
-        0,
-    )
+    available = await _get_available_stock(sheets, row_idx, inv_headers)
     kategori = rec.get("Kategori") or "-"
     witel = rec.get("Witel") or "-"
     divisi = rec.get("Divisi") or "-"
@@ -916,8 +1021,8 @@ async def borrow_item_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     # read availability + specs (best-effort)
     sheets = context.application.bot_data.get("sheets_manager")
-    available = None
-    specs = []
+    available: Optional[int] = None
+    specs: List[str] = []
     kategori = ""
     owner_name = ""
 
@@ -930,14 +1035,7 @@ async def borrow_item_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 headers_map=headers,
             )
             if row_idx:
-                col_ters = headers.get("Tersedia")
-                if col_ters:
-                    cur = await sheets.async_get_cell_value(
-                        INVENTARIS_SHEET,
-                        row_idx,
-                        col_ters,
-                    )
-                    available = safe_int(cur, 0)
+                available = await _get_available_stock(sheets, row_idx, headers)
 
                 recs = await sheets.async_get_all_records(INVENTARIS_SHEET)
                 idx0 = row_idx - 2
@@ -1315,7 +1413,8 @@ async def handle_borrow_message(
             await send_md(update, "❌ Layanan Google Sheets belum tersedia.")
             return True
 
-        row_idx = await _find_item_row_by_name(sheets, item_name)
+        inv_headers = await _ensure_inventaris_headers(sheets)
+        row_idx = await _find_item_row_by_name(sheets, item_name, headers_map=inv_headers)
         if not row_idx:
             await send_md(
                 update,
@@ -1326,7 +1425,7 @@ async def handle_borrow_message(
                 context.user_data.pop(k, None)
             return True
 
-        owner_id, _ = await _get_owner_for_item(sheets, row_idx)
+        owner_id, _ = await _get_owner_for_item(sheets, row_idx, inv_headers)
         if owner_id and user and owner_id == user.id:
             await send_md(
                 update,
@@ -1336,18 +1435,17 @@ async def handle_borrow_message(
                 context.user_data.pop(k, None)
             return True
 
-        inv_headers = await _ensure_inventaris_headers(sheets)
-        tersedia_col = inv_headers.get("Tersedia")
-        cur_ters = (
-            await sheets.async_get_cell_value(
-                INVENTARIS_SHEET,
-                row_idx,
-                tersedia_col,
+        available = await _get_available_stock(sheets, row_idx, inv_headers)
+        if available <= 0:
+            await send_md(
+                update,
+                f"⚠️ Stok untuk *{escape_md(item_name)}* saat ini: {available}. Tidak dapat meminjam sekarang.",
+                parse_mode="Markdown",
             )
-            if tersedia_col
-            else ""
-        )
-        available = safe_int(cur_ters, 0)
+            for k in (_KEY_STEP, _KEY_CATEGORY, _KEY_CHOICE, _KEY_QTY):
+                context.user_data.pop(k, None)
+            return True
+
         if qty > available:
             await send_md(
                 update,
