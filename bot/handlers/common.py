@@ -468,28 +468,28 @@ async def require_registration(target, context: "ContextTypes.DEFAULT_TYPE") -> 
         try:
             uh = await sheets.async_ensure_headers("Users", ["User ID", "Nama", "Role", "Witel", "Divisi"])
         except Exception:
-            # if ensure headers fails, fall back to telling user to /start
-            await send_md(target, "❌ Gagal memeriksa data pengguna. Coba /start atau hubungi admin.")
+            # if ensure headers fails, fall back to telling user to /regis
+            await send_md(target, "❌ Gagal memeriksa data pengguna. Coba /regis atau hubungi admin.")
             return False
 
         uid = str(user.id)
         row_idx = await sheets.async_find_row_by_value("Users", "User ID", uid, headers_map=uh)
         if not row_idx:
-            # user not in sheet — ask to /start
-            await send_md(target, "ℹ️ Akunmu belum didaftarkan. Silakan jalankan `/start` dan lengkapi Witel & Divisi.", parse_mode="Markdown")
+            # user not in sheet — ask to /regis
+            await send_md(target, "ℹ️ Akunmu belum didaftarkan. Silakan jalankan /regis dan lengkapi Witel & Divisi.", parse_mode="Markdown")
             return False
 
         cur_witel = str(await sheets.async_get_cell_value("Users", row_idx, uh["Witel"]) or "").strip()
         cur_divisi = str(await sheets.async_get_cell_value("Users", row_idx, uh["Divisi"]) or "").strip()
         if not cur_witel or not cur_divisi:
-            await send_md(target, "ℹ️ Profil belum lengkap. Silakan jalankan `/start` untuk mengisi *Witel* dan *Divisi*.", parse_mode="Markdown")
+            await send_md(target, "ℹ️ Profil belum lengkap. Silakan jalankan /regis untuk mengisi *Witel* dan *Divisi*.", parse_mode="Markdown")
             return False
 
         return True
     except Exception:
-        # defensive fallback: if something goes wrong, block action and ask to /start
+        # defensive fallback: if something goes wrong, block action and ask to /regis
         try:
-            await send_md(target, "⚠️ Gagal memverifikasi profil. Silakan jalankan `/start` atau hubungi admin.")
+            await send_md(target, "⚠️ Gagal memverifikasi profil. Silakan jalankan /regis atau hubungi admin.")
         except Exception:
             pass
         return False
