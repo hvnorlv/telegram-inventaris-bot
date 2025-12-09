@@ -2,17 +2,20 @@
 """
 Add handlers for inventory bot.
 
-UPDATE:
-- Witel & Divisi barang otomatis diambil dari profil pemilik (sheet "Users").
-- Custom & generic flow now ask for an optional Serial Number.
-- Serial Number disimpan ke kolom "Serial Number".
-- Duplicate detection membandingkan:
-  (Nama Barang, Kategori, Witel, Divisi, Pemilik Nama, Keterangan 1, Keterangan 2, Serial Number)
+UPDATES in this rewrite:
+- Ensure "Item ID" column exists and populate it for new items.
+- When merging to existing row (duplicate detection), keep existing Item ID.
+- Show Item ID in confirmations and final messages.
+- Minimal internal helper _make_item_id() provided here.
+- Robust state handling to avoid missing context before confirmation.
 """
 from __future__ import annotations
 
 import asyncio
 import logging
+import random
+import string
+from datetime import datetime
 from typing import Any, Dict, Optional, Tuple, List
 
 from telegram import (
@@ -32,13 +35,13 @@ from telegram.ext import (
 
 from handlers.common import send_md, escape_md, clear_steps
 from config import PRESET_CATEGORIES, INVENTARIS_SHEET
-from utils import sanitize_input, safe_int, build_name_from_spec
+from utils import sanitize_input, safe_int, build_name_from_spec, ensure_str
 
 logger = logging.getLogger("handlers.add")
 logger.addHandler(logging.NullHandler())
 
 # ---------------------------------------------------------------------------
-# Presets
+# Presets (unchanged)
 # ---------------------------------------------------------------------------
 BRAND_MODELS: Dict[str, List[str]] = {
     "Fiberhome": ["FHS-24", "FHS-48", "FHS-24-POE"],
@@ -54,6 +57,14 @@ SFP_DISTANCES = ["0.5", "1", "2", "10"]
 
 ATTENUATOR_DB_PRESETS = ["3", "5", "10", "20"]  # dB presets
 PC_LENGTH_PRESETS = ["0.5", "1", "2", "3", "5", "10"]  # meter presets
+
+# ---------------------------------------------------------------------------
+# Small helper: generate Item ID
+# ---------------------------------------------------------------------------
+def _make_item_id(prefix: str = "ITM") -> str:
+    ts = datetime.utcnow().strftime("%Y%m%d%H%M%S")
+    rnd = "".join(random.choices(string.ascii_uppercase + string.digits, k=4))
+    return f"{prefix}-{ts}-{rnd}"
 
 
 # ---------------------------------------------------------------------------
@@ -112,12 +123,17 @@ async def _get_user_profile_witel_divisi(
     """
     try:
         uh = await _ensure_users_headers(sheets)
-        row_idx = await sheets.async_find_row_by_value(
-            "Users",
-            "User ID",
-            str(user_id),
-            headers_map=uh,
-        )
+        row_idx = None
+        if hasattr(sheets, "async_find_row_by_value"):
+            try:
+                row_idx = await sheets.async_find_row_by_value(
+                    "Users",
+                    "User ID",
+                    str(user_id),
+                    headers_map=uh,
+                )
+            except Exception:
+                row_idx = None
         if not row_idx:
             return "", ""
 
@@ -125,13 +141,16 @@ async def _get_user_profile_witel_divisi(
         d = await sheets.async_get_cell_value("Users", row_idx, uh.get("Divisi"))
         return str(w or "").strip(), str(d or "").strip()
     except Exception:
+        logger.debug("_get_user_profile_witel_divisi: failed", exc_info=True)
         return "", ""
 
 
 async def _ensure_inventaris_headers(sheets) -> Dict[str, int]:
+    # ensure Item ID exists as first/explicit header
     return await sheets.async_ensure_headers(
         INVENTARIS_SHEET,
         [
+            "Item ID",
             "Nama Barang",
             "Kategori",
             "Witel",
@@ -338,7 +357,7 @@ async def pc_connector_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         return
 
-    state["specs"]["connector"] = token
+    state["specs"]["connector"] = sanitize_input(token)
     kb = [[InlineKeyboardButton(f"{L}m", callback_data=f"pc_length:{L}")] for L in PC_LENGTH_PRESETS]
     kb.append(
         [InlineKeyboardButton("Manual (ketik panjang)", callback_data="pc_length:manual")]
@@ -645,7 +664,7 @@ async def l2_model_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 # ---------------------------------------------------------------------------
-# Quantity choices helper (inline, saat ini belum dipakai langsung)
+# Quantity choices helper
 # ---------------------------------------------------------------------------
 def _quantity_kb() -> InlineKeyboardMarkup:
     qs = [1, 2, 3, 5, 10, 20, 50]
@@ -1091,11 +1110,13 @@ async def _find_duplicate_row_and_headers(
 ):
     """
     Returns (row_idx, headers) if duplicate found, else (None, headers).
+    Duplicate detection preserves existing Item ID - merging happens into that row.
     """
     headers = await retry_async(
         sheets.async_ensure_headers,
         INVENTARIS_SHEET,
         [
+            "Item ID",
             "Nama Barang",
             "Kategori",
             "Witel",
@@ -1144,6 +1165,7 @@ async def _find_duplicate_row_and_headers(
                 and _normalize(r.get("Keterangan 2")) == target["k2"]
                 and _normalize(r.get("Serial Number")) == target["k3"]
             ):
+                # return 1-based row index (account for header)
                 return idx + 2, headers
         except Exception:
             continue
@@ -1242,6 +1264,7 @@ async def _finalize_add(update_or_cq: Any, context: ContextTypes.DEFAULT_TYPE):
         total_col = headers.get("Total Qty")
         ters_col = headers.get("Tersedia")
         status_col = headers.get("Status")
+        itemid_col = headers.get("Item ID")
 
         try:
             ok1, new_total = await retry_async(
@@ -1267,6 +1290,7 @@ async def _finalize_add(update_or_cq: Any, context: ContextTypes.DEFAULT_TYPE):
                 allowed_exceptions=(Exception,),
             )
 
+            # ensure status set to Tersedia if previously removed/empty
             try:
                 cur_status = (
                     await sheets.async_get_cell_value(
@@ -1297,6 +1321,18 @@ async def _finalize_add(update_or_cq: Any, context: ContextTypes.DEFAULT_TYPE):
                 )
 
             if ok1 and ok2:
+                # Read existing Item ID to show to user
+                try:
+                    existing_item_id = ""
+                    if itemid_col:
+                        existing_item_id = await sheets.async_get_cell_value(
+                            INVENTARIS_SHEET,
+                            dup_row,
+                            itemid_col,
+                        )
+                except Exception:
+                    existing_item_id = ""
+
                 try:
                     await sheets.async_write_log(
                         str(user.id),
@@ -1307,10 +1343,11 @@ async def _finalize_add(update_or_cq: Any, context: ContextTypes.DEFAULT_TYPE):
                 except Exception:
                     pass
 
+                id_display = f" (Item ID `{escape_md(str(existing_item_id))}`)" if existing_item_id else ""
                 await send_md(
                     update_or_cq,
                     f"✅ Item sudah ada — stok diperbarui: +{qty} pada "
-                    f"*{escape_md(nama_barang_cell)}*.",
+                    f"*{escape_md(nama_barang_cell)}*{id_display}.",
                     parse_mode="Markdown",
                 )
                 context.user_data.pop("add_flow", None)
@@ -1328,7 +1365,7 @@ async def _finalize_add(update_or_cq: Any, context: ContextTypes.DEFAULT_TYPE):
                 exc_info=True,
             )
 
-    # Append new row
+    # Append new row (no duplicate found OR increment failed)
     try:
         headers = headers or await _ensure_inventaris_headers(sheets)
     except Exception as e:
@@ -1350,6 +1387,10 @@ async def _finalize_add(update_or_cq: Any, context: ContextTypes.DEFAULT_TYPE):
         if idx:
             row[idx - 1] = "" if val is None else str(val)
 
+    # Generate a new Item ID
+    item_id = _make_item_id()
+
+    _set("Item ID", item_id)
     _set("Nama Barang", nama_barang_cell)
     _set("Kategori", cat)
     _set("Witel", witel)
@@ -1384,7 +1425,7 @@ async def _finalize_add(update_or_cq: Any, context: ContextTypes.DEFAULT_TYPE):
                 str(user.id),
                 "Tambah",
                 nama_barang_cell,
-                f"Qty {qty} | Witel={witel} Divisi={divisi}",
+                f"Qty {qty} | Witel={witel} Divisi={divisi} itemid={item_id}",
                 retries=3,
                 delay=0.5,
                 backoff=2.0,
@@ -1396,7 +1437,7 @@ async def _finalize_add(update_or_cq: Any, context: ContextTypes.DEFAULT_TYPE):
         await send_md(
             update_or_cq,
             f"✅ Berhasil menambahkan *{escape_md(nama_barang_cell)}* sebanyak "
-            f"*{qty}* ke Inventaris.",
+            f"*{qty}* ke Inventaris. Item ID: `{escape_md(item_id)}`",
             parse_mode="Markdown",
         )
     else:
